@@ -20,6 +20,8 @@ spec:
     - name: post-slack-message
       image: $(params.IMAGE)
       env:
+        - name: HOME
+          value: /tmp
         - name: URL
           valueFrom:
             secretKeyRef:

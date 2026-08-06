@@ -15,6 +15,9 @@ spec:
     - name: evaluate-test-suites
       image: $(params.IMAGE)
       workingDir: $(workspaces.results.path)
+      env:
+        - name: HOME
+          value: /tmp
       script: |
         #!/usr/bin/env bash
         set -euo pipefail

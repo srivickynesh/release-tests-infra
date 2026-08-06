@@ -15,6 +15,8 @@ spec:
     - name: create-cleanup-job
       image: $(params.IMAGE)
       env:
+        - name: HOME
+          value: /tmp
         - name: NAMESPACE
           value: $(context.taskRun.namespace)
       script: |

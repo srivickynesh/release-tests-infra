@@ -313,9 +313,9 @@ spec:
     taskRef:
       name: generate-build-artifacts
     when:
-      - input: $(params.INSTALL_PIPELINES_OPERATOR)
-        operator: in
-        values: ["true", "True"]
+      - input: "$(params.INSTALL_PIPELINES_OPERATOR)-$(params.IS_DISCONNECTED)"
+        operator: notin
+        values: ["false-false", "False-false"]
     workspaces:
       - name: build-artifacts
         workspace: data
@@ -337,9 +337,9 @@ spec:
       - generate-build-artifacts
       - setup-testing-accounts
     when:
-      - input: $(params.INSTALL_PIPELINES_OPERATOR)
-        operator: in
-        values: ["true", "True"]
+      - input: "$(params.INSTALL_PIPELINES_OPERATOR)-$(params.IS_DISCONNECTED)"
+        operator: notin
+        values: ["false-false", "False-false"]
     workspaces:
       - name: build-artifacts
         workspace: data

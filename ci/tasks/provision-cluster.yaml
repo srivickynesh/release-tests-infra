@@ -46,13 +46,20 @@ spec:
     - name: installer
     - name: mirror-registry
       description: URL of mirror registry (disconnected clusters) or quay.io
+  stepTemplate:
+    env:
+      - name: HOME
+        value: /tmp
+    securityContext:
+      runAsNonRoot: true
+      runAsUser: 1001
   steps:
     # ============================================================
     # Step 1: AWS IPI provisioning
     # ============================================================
     - name: aws-ipi
       onError: continue
-      image: image-registry.openshift-image-registry.svc:5000/openshift/cli:latest
+      image: quay.io/openshift-pipeline/ci:latest
       workingDir: /mnt
       env:
         - name: AWS_ACCESS_KEY_ID
@@ -232,7 +239,7 @@ spec:
     # ============================================================
     - name: aro
       onError: continue
-      image: image-registry.openshift-image-registry.svc:5000/openshift/cli:latest
+      image: quay.io/openshift-pipeline/ci:latest
       workingDir: /mnt
       env:
         - name: AZURE_TENANT
@@ -570,7 +577,7 @@ spec:
     # Step 4: Skip provisioning (cluster-platforms / none)
     # ============================================================
     - name: skip-provision
-      image: image-registry.openshift-image-registry.svc:5000/openshift/cli:latest
+      image: quay.io/openshift-pipeline/ci:latest
       workingDir: /mnt
       script: |
         #!/usr/bin/env bash

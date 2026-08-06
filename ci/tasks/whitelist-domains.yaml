@@ -18,6 +18,9 @@ spec:
   steps:
     - name: whitelist
       image: $(params.IMAGE)
+      env:
+        - name: HOME
+          value: /tmp
       script: |
         #!/usr/bin/env bash
         set -euo pipefail

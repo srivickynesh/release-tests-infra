@@ -23,6 +23,8 @@ spec:
       image: image-registry.openshift-image-registry.svc:5000/openshift/cli:latest
       workingDir: /mnt
       env:
+        - name: HOME
+          value: /tmp
         - name: AWS_ACCESS_KEY_ID
           valueFrom:
             secretKeyRef:
@@ -146,6 +148,8 @@ spec:
       image: image-registry.openshift-image-registry.svc:5000/openshift/cli:latest
       workingDir: /mnt
       env:
+        - name: HOME
+          value: /tmp
         - name: AZURE_TENANT
           valueFrom:
             secretKeyRef:

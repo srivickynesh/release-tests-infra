@@ -17,6 +17,8 @@ spec:
     - name: mirror-and-tag-imagestreams
       image: $(params.IMAGE)
       env:
+        - name: HOME
+          value: /tmp
         - name: ADMIN_NAME
           valueFrom:
             secretKeyRef:

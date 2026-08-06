@@ -33,6 +33,8 @@ spec:
     - name: generate-build-artifacts
       image: $(params.IMAGE)
       env:
+        - name: HOME
+          value: /tmp
         - name: USERNAME
           valueFrom:
             secretKeyRef:

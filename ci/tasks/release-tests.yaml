@@ -53,6 +53,8 @@ spec:
       image: $(params.IMAGE)
       workingDir: $(workspaces.release-tests-git.path)
       env:
+        - name: HOME
+          value: /tmp
         - name: PAC_GITHUB_TOKEN
           valueFrom:
             secretKeyRef:

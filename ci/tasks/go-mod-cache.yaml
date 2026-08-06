@@ -21,6 +21,8 @@ spec:
     - name: download
       image: $(params.IMAGE)
       env:
+        - name: HOME
+          value: /tmp
         - name: ADMIN_TOKEN
           valueFrom:
             secretKeyRef:

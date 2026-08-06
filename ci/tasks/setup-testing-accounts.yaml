@@ -12,6 +12,8 @@ spec:
   steps:
     - name: setup-testing-accounts
       env:
+        - name: HOME
+          value: /tmp
         - name: ADMIN_NAME
           valueFrom:
             secretKeyRef:

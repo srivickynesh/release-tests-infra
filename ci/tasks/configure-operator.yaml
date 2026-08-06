@@ -23,6 +23,8 @@ spec:
   steps:
     - name: configure-operator
       env:
+        - name: HOME
+          value: /tmp
         - name: ADMIN_NAME
           valueFrom:
             secretKeyRef:
