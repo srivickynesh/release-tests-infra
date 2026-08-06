@@ -12,6 +12,9 @@ spec:
     - name: CATALOG_SOURCE
       description: provide catalog-source name through which user have to subscribe operator
       default: custom-operators
+    - name: IS_DISCONNECTED
+      description: Flag to identify disconnected nature of cluster
+      default: "false"
     - name: OPERATOR_ENVIRONMENT
       description: |
         Specify p12n operator environment (e.g. prod, stage, pre-stage).
@@ -43,36 +46,54 @@ spec:
             secretKeyRef:
               key: api-url
               name: cluster-$(params.CLUSTER_NAME)
-      image: image-registry.openshift-image-registry.svc:5000/openshift/cli:latest
+      image: quay.io/openshift-pipeline/ci:latest
       script: |
           #!/usr/bin/env bash
           set -euo pipefail
 
-          if [[ $(params.OPERATOR_ENVIRONMENT) == "prod" ]]; then
-            echo -e "It's not necessary to apply image content source policy and create a custom operator source in prod."
+          if [[ "$(params.OPERATOR_ENVIRONMENT)" == "prod" && "$(params.IS_DISCONNECTED)" == "false" ]]; then
+            echo "Not necessary to configure operator in prod (non-disconnected)."
             exit 0
           fi
 
           ADMIN_NAME=${ADMIN_NAME:-kubeadmin}
           if [[ -n "${ADMIN_PASSWORD:-}" ]]; then
             echo "Logging in to cluster $(params.CLUSTER_NAME) as user '$ADMIN_NAME'"
-            oc login -u $ADMIN_NAME -p $ADMIN_PASSWORD $APISERVER --insecure-skip-tls-verify=true
+            oc login -u "$ADMIN_NAME" -p "$ADMIN_PASSWORD" "$APISERVER" --insecure-skip-tls-verify=true
           elif [[ -n "${ADMIN_TOKEN:-}" ]]; then
             echo "Logging in to cluster $(params.CLUSTER_NAME) with token"
-            oc login --token=$ADMIN_TOKEN $APISERVER --insecure-skip-tls-verify=true
+            oc login --token="$ADMIN_TOKEN" "$APISERVER" --insecure-skip-tls-verify=true
           else
             echo "ERROR: no credentials in cluster secret"; exit 1
           fi
 
-          echo -e "Creating custom catalog source"
-          oc apply -f $(workspaces.build-artifacts.path)/catalog-source.yaml
+          if [[ "$(params.IS_DISCONNECTED)" == "true" ]]; then
+            echo "=== Configuring disconnected cluster ==="
+
+            oc delete catsrc qe-app-registry -n openshift-marketplace 2>/dev/null || true
+
+            if [ -f "$(workspaces.build-artifacts.path)/idms-oc-mirror.yaml" ]; then
+              echo "Applying ImageDigestMirrorSet from oc-mirror"
+              oc apply -f "$(workspaces.build-artifacts.path)/idms-oc-mirror.yaml"
+            fi
+
+            for cs in "$(workspaces.build-artifacts.path)"/cs-*.yaml; do
+              if [ -f "$cs" ]; then
+                echo "Applying CatalogSource: $cs"
+                oc apply -f "$cs"
+              fi
+            done
+          fi
+
+          echo "Creating custom catalog source"
+          oc apply -f "$(workspaces.build-artifacts.path)/catalog-source.yaml"
           sleep 30
 
           echo "Waiting for pods in namespace openshift-marketplace to be ready"
           pods=$(oc get pods -n openshift-marketplace --sort-by={metadata.creationTimestamp} -o name | \
-          grep $(params.CATALOG_SOURCE) | tail -1)
+          grep "$(params.CATALOG_SOURCE)" | tail -1)
 
           for pod in ${pods}; do
             echo "Waiting for pod $pod in openshift-marketplace to be in ready state"
-            oc wait --for=condition=Ready -n openshift-marketplace $pod --timeout=5m
+            oc wait --for=condition=Ready -n openshift-marketplace "$pod" --timeout=5m
           done

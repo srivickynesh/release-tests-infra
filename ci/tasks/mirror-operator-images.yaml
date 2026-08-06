@@ -1,0 +1,63 @@
+apiVersion: tekton.dev/v1
+kind: Task
+metadata:
+  name: mirror-operator-images
+spec:
+  workspaces:
+    - name: build-artifacts
+  params:
+    - name: IS_DISCONNECTED
+      description: Flag to identify disconnected nature of cluster
+      default: "false"
+    - name: MIRROR_REGISTRY
+      description: Mirror registry URL (e.g. bastion:5000)
+      default: "quay.io"
+    - name: OPERATOR_ENVIRONMENT
+      description: Operator environment (prod, stage, pre-stage)
+      default: pre-stage
+    - name: IMAGE
+      description: CI image with oc-mirror installed
+      default: quay.io/openshift-pipeline/ci:latest
+  steps:
+    - name: mirror-operator-images
+      image: $(params.IMAGE)
+      script: |
+        #!/usr/bin/env bash
+        set -euo pipefail
+
+        if [[ "$(params.IS_DISCONNECTED)" != "true" ]]; then
+          echo "Not a disconnected cluster — skipping image mirroring."
+          exit 0
+        fi
+
+        if [ ! -f "$(workspaces.build-artifacts.path)/pull-secret" ]; then
+          echo "ERROR: pull-secret not found in build-artifacts workspace"
+          exit 1
+        fi
+
+        if [ ! -f "$(workspaces.build-artifacts.path)/imageset-config.yaml" ]; then
+          echo "ERROR: imageset-config.yaml not found in build-artifacts workspace"
+          exit 1
+        fi
+
+        REG_CREDS="$(workspaces.build-artifacts.path)/pull-secret"
+        MIRROR_REG="$(params.MIRROR_REGISTRY)"
+
+        echo "=== Mirroring operator images to ${MIRROR_REG} ==="
+        oc-mirror --v2 \
+          --config="$(workspaces.build-artifacts.path)/imageset-config.yaml" \
+          --workspace file://./oc-mirror-workspace \
+          --src-tls-verify=false \
+          --dest-tls-verify=false \
+          "docker://${MIRROR_REG}" \
+          --authfile "${REG_CREDS}" --log-level info
+
+        MANIFESTS_DIR=$(ls -d oc-mirror-workspace/working-dir/cluster-resources/ 2>/dev/null | head -n1 || true)
+        echo "MANIFESTS_DIR: ${MANIFESTS_DIR:-<none>}"
+        if [[ -n "$MANIFESTS_DIR" ]]; then
+          cp "${MANIFESTS_DIR}"/*.yaml "$(workspaces.build-artifacts.path)/" || true
+          echo "Copied oc-mirror manifests to build-artifacts workspace"
+          ls -la "$(workspaces.build-artifacts.path)/"*.yaml 2>/dev/null || true
+        fi
+
+        echo "=== Image mirroring complete ==="

@@ -9,16 +9,42 @@ spec:
     - name: CATALOG_SOURCE
       description: Catalog source name for the operator subscription
       default: custom-operators
+    - name: IS_DISCONNECTED
+      description: Flag to decide if provisioned cluster is disconnected
+      default: "false"
     - name: KONFLUX_INDEX_IMAGE
       description: |
         Konflux index image URL, e.g.
         quay.io/openshift-pipeline/pipelines-index-4.21:v1.20.5
+      default: ""
+    - name: MIRROR_REGISTRY
+      description: Mirror registry URL for disconnected environments
+      default: "quay.io"
+    - name: OPENSHIFT_VERSION
+      description: OCP version used to determine operator index tags
+      default: ""
     - name: OPERATOR_ENVIRONMENT
       description: prod / redhat-operators skips custom catalog generation
       default: pre-stage
+    - name: IMAGE
+      description: CI image to use
+      default: quay.io/openshift-pipeline/ci:latest
   steps:
-    - name: generate-catalog-source
-      image: image-registry.openshift-image-registry.svc:5000/openshift/cli:latest
+    - name: generate-build-artifacts
+      image: $(params.IMAGE)
+      env:
+        - name: USERNAME
+          valueFrom:
+            secretKeyRef:
+              name: p12n
+              key: quay-user
+              optional: true
+        - name: PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: p12n
+              key: quay-password
+              optional: true
       script: |
           #!/usr/bin/env bash
           set -euo pipefail
@@ -26,10 +52,12 @@ spec:
           CATALOG_SOURCE="$(params.CATALOG_SOURCE)"
           OPERATOR_ENVIRONMENT="$(params.OPERATOR_ENVIRONMENT)"
           INDEX_IMAGE="$(params.KONFLUX_INDEX_IMAGE)"
+          IS_DISCONNECTED="$(params.IS_DISCONNECTED)"
+          MIRROR_REG="$(params.MIRROR_REGISTRY)"
           OUT="$(workspaces.build-artifacts.path)/catalog-source.yaml"
 
-          if [[ "$OPERATOR_ENVIRONMENT" == "prod" || "$CATALOG_SOURCE" == "redhat-operators" ]]; then
-            echo "Skipping custom CatalogSource (env=${OPERATOR_ENVIRONMENT}, source=${CATALOG_SOURCE})"
+          if [[ "$OPERATOR_ENVIRONMENT" == "prod" && "$IS_DISCONNECTED" == "false" ]]; then
+            echo "Skipping build artifacts (env=prod, not disconnected)"
             exit 0
           fi
 
@@ -38,21 +66,97 @@ spec:
             exit 1
           fi
 
-          echo "Generating CatalogSource '${CATALOG_SOURCE}' from index: ${INDEX_IMAGE}"
-          printf '%s\n' \
-            "apiVersion: operators.coreos.com/v1alpha1" \
-            "kind: CatalogSource" \
-            "metadata:" \
-            "  name: ${CATALOG_SOURCE}" \
-            "  namespace: openshift-marketplace" \
-            "spec:" \
-            "  sourceType: grpc" \
-            "  image: ${INDEX_IMAGE}" \
-            "  displayName: ${CATALOG_SOURCE}" \
-            "  updateStrategy:" \
-            "    registryPoll:" \
-            "      interval: 30m" \
-            > "$OUT"
+          OUTPUT_IMAGE="$INDEX_IMAGE"
 
-          echo "CatalogSource YAML generated at ${OUT}"
+          # Copy pull-secret to workspace for downstream tasks
+          if [ -f "/config/pull-secret" ]; then
+            cp /config/pull-secret "$(workspaces.build-artifacts.path)/pull-secret"
+          fi
+
+          REG_CREDS="$(workspaces.build-artifacts.path)/pull-secret"
+
+          if [[ -f "$REG_CREDS" ]]; then
+            if [[ "$IS_DISCONNECTED" == "true" ]]; then
+              echo "Logging into mirror registry ${MIRROR_REG} (disconnected)"
+              oc registry login --insecure=true --registry="$MIRROR_REG" \
+                --auth-basic="dummy:dummy" --to="$REG_CREDS" 2>/dev/null || true
+            elif [[ -n "${USERNAME:-}" && -n "${PASSWORD:-}" ]]; then
+              echo "Logging into ${MIRROR_REG} registry"
+              oc registry login --insecure=true --registry="$MIRROR_REG" \
+                --auth-basic="${USERNAME}:${PASSWORD}" --to="$REG_CREDS" 2>/dev/null || true
+            fi
+          fi
+
+          echo "Generating CatalogSource '${CATALOG_SOURCE}' from index: ${OUTPUT_IMAGE}"
+          cat > "$OUT" <<EOF
+          apiVersion: operators.coreos.com/v1alpha1
+          kind: CatalogSource
+          metadata:
+            name: ${CATALOG_SOURCE}
+            namespace: openshift-marketplace
+          spec:
+            sourceType: grpc
+            image: ${OUTPUT_IMAGE}
+            displayName: ${CATALOG_SOURCE}
+            updateStrategy:
+              registryPoll:
+                interval: 30m
+          EOF
+          sed -i 's/^          //' "$OUT"
+
+          echo "CatalogSource YAML:"
           cat "$OUT"
+
+          if [[ "$IS_DISCONNECTED" == "true" ]]; then
+            OCP_MAJOR_MINOR=$(echo -n "$(params.OPENSHIFT_VERSION)" | grep -oE '[0-9]+\.[0-9]+' || echo "4.19")
+            OCP_MAJOR=$(echo "$OCP_MAJOR_MINOR" | cut -d. -f1)
+            OCP_MINOR=$(echo "$OCP_MAJOR_MINOR" | cut -d. -f2)
+            if [ "$OCP_MAJOR" -eq 4 ] && [ "$OCP_MINOR" -le 17 ]; then
+              CL_CHANNEL="stable-6.1"
+            else
+              CL_CHANNEL="stable-6.3"
+            fi
+
+            echo ""
+            echo "Generating imageset-config.yaml for oc-mirror (disconnected)"
+            cat > "$(workspaces.build-artifacts.path)/imageset-config.yaml" <<EOF
+          ---
+          kind: ImageSetConfiguration
+          apiVersion: mirror.openshift.io/v2alpha1
+          mirror:
+            operators:
+              - catalog: ${INDEX_IMAGE}
+                packages:
+                - name: openshift-pipelines-operator-rh
+                  channels:
+                  - name: latest
+              - catalog: registry.redhat.io/redhat/redhat-operator-index:v${OCP_MAJOR_MINOR}
+                packages:
+                - name: loki-operator
+                  channels:
+                  - name: ${CL_CHANNEL}
+                - name: cluster-logging
+                  channels:
+                  - name: ${CL_CHANNEL}
+            additionalImages:
+            - name: quay.io/minio/minio:latest
+            - name: registry.redhat.io/rhel9/buildah:latest
+            - name: registry.redhat.io/rhel9/postgresql-16:latest
+            - name: registry.redhat.io/rhel9/skopeo:latest
+            - name: registry.redhat.io/ubi9/ubi-minimal:latest
+            - name: registry.redhat.io/ubi9/openjdk-17:latest
+            - name: registry.redhat.io/openshift4/ose-cli-rhel9:v${OCP_MAJOR_MINOR}
+          EOF
+            sed -i 's/^          //' "$(workspaces.build-artifacts.path)/imageset-config.yaml"
+
+            echo "imageset-config.yaml:"
+            cat "$(workspaces.build-artifacts.path)/imageset-config.yaml"
+          fi
+      volumeMounts:
+        - name: dockerconfig
+          mountPath: "/config"
+  volumes:
+    - name: dockerconfig
+      secret:
+        secretName: flexy
+        optional: true

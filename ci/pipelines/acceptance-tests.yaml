@@ -5,7 +5,7 @@ metadata:
 spec:
   params:
   - name: INSTALLER
-    description: "Provisioning method: aws-ipi, aro, cluster-platforms, none"
+    description: "Provisioning method: aws-ipi, aro, flexy, cluster-platforms, none"
     default: cluster-platforms
   - name: ARCH
     description: cluster architecture
@@ -82,6 +82,19 @@ spec:
   - name: SEND_SLACK_NOTIFICATION
     description: Post pipeline status to Slack (requires slack webhook secret)
     default: "false"
+  - name: IS_DISCONNECTED
+    description: Flag to decide if provisioned cluster is disconnected
+    default: "false"
+  - name: TEMPLATE
+    description: Flexy template path (only when INSTALLER=flexy)
+    default: ""
+  - name: LAUNCHER_VARS
+    description: JSON config for Flexy (only when INSTALLER=flexy)
+    default: ""
+  - name: GIT_PRIVATE_TEMPLATES_BRANCH
+    default: master
+  - name: GIT_PRIVATE_TEMPLATES_URI
+    default: https://gitlab.cee.redhat.com/aosqe/flexy-templates.git
   workspaces:
   - name: data
     description: Per-PipelineRun PVC (git, results, gomod-cache subPaths). Use ReadWriteMany for parallel suites.
@@ -106,9 +119,17 @@ spec:
         value: $(params.ARCH)
       - name: CLUSTER_LIFETIME
         value: $(params.CLUSTER_LIFETIME)
+      - name: TEMPLATE
+        value: $(params.TEMPLATE)
+      - name: LAUNCHER_VARS
+        value: $(params.LAUNCHER_VARS)
+      - name: GIT_PRIVATE_TEMPLATES_BRANCH
+        value: $(params.GIT_PRIVATE_TEMPLATES_BRANCH)
+      - name: GIT_PRIVATE_TEMPLATES_URI
+        value: $(params.GIT_PRIVATE_TEMPLATES_URI)
     taskRef:
       name: provision-cluster
-    timeout: 60m
+    timeout: 3h
 
   # --- Clone repos ---
   - name: clone-infra-git
@@ -281,17 +302,17 @@ spec:
         value: $(params.KONFLUX_INDEX_IMAGE)
       - name: OPERATOR_ENVIRONMENT
         value: $(params.OPERATOR_ENVIRONMENT)
+      - name: IS_DISCONNECTED
+        value: $(params.IS_DISCONNECTED)
+      - name: MIRROR_REGISTRY
+        value: $(tasks.provision-cluster.results.mirror-registry)
+      - name: OPENSHIFT_VERSION
+        value: $(params.OPENSHIFT_VERSION)
     runAfter:
       - clone-infra-git
     taskRef:
       name: generate-build-artifacts
     when:
-      - input: $(params.OPERATOR_ENVIRONMENT)
-        operator: notin
-        values: ["prod"]
-      - input: $(params.CATALOG_SOURCE)
-        operator: notin
-        values: ["redhat-operators"]
       - input: $(params.INSTALL_PIPELINES_OPERATOR)
         operator: in
         values: ["true", "True"]
@@ -308,19 +329,75 @@ spec:
         value: $(params.CATALOG_SOURCE)
       - name: OPERATOR_ENVIRONMENT
         value: $(params.OPERATOR_ENVIRONMENT)
+      - name: IS_DISCONNECTED
+        value: $(params.IS_DISCONNECTED)
     taskRef:
       name: configure-operator
     runAfter:
       - generate-build-artifacts
       - setup-testing-accounts
     when:
-      - input: $(params.OPERATOR_ENVIRONMENT)
-        operator: notin
-        values: ["prod"]
-      - input: $(params.CATALOG_SOURCE)
-        operator: notin
-        values: ["redhat-operators"]
       - input: $(params.INSTALL_PIPELINES_OPERATOR)
+        operator: in
+        values: ["true", "True"]
+    workspaces:
+      - name: build-artifacts
+        workspace: data
+        subPath: build-artifacts
+
+  - name: whitelist-domains
+    params:
+      - name: IS_DISCONNECTED
+        value: $(params.IS_DISCONNECTED)
+      - name: PROXY_HOST
+        value: $(tasks.provision-cluster.results.mirror-registry)
+      - name: IMAGE
+        value: $(params.IMAGE)
+    runAfter:
+      - provision-cluster
+    taskRef:
+      name: whitelist-domains
+    when:
+      - input: $(params.IS_DISCONNECTED)
+        operator: in
+        values: ["true", "True"]
+
+  - name: mirror-operator-images
+    params:
+      - name: IS_DISCONNECTED
+        value: $(params.IS_DISCONNECTED)
+      - name: MIRROR_REGISTRY
+        value: $(tasks.provision-cluster.results.mirror-registry)
+      - name: OPERATOR_ENVIRONMENT
+        value: $(params.OPERATOR_ENVIRONMENT)
+      - name: IMAGE
+        value: $(params.IMAGE)
+    runAfter:
+      - generate-build-artifacts
+    taskRef:
+      name: mirror-operator-images
+    timeout: 120m
+    when:
+      - input: $(params.IS_DISCONNECTED)
+        operator: in
+        values: ["true", "True"]
+    workspaces:
+      - name: build-artifacts
+        workspace: data
+        subPath: build-artifacts
+
+  - name: mirror-and-tag-imagestreams
+    params:
+      - name: CLUSTER_NAME
+        value: $(tasks.provision-cluster.results.cluster-name)
+      - name: IMAGE
+        value: $(params.IMAGE)
+    runAfter:
+      - mirror-operator-images
+    taskRef:
+      name: mirror-and-tag-imagestreams
+    when:
+      - input: $(params.IS_DISCONNECTED)
         operator: in
         values: ["true", "True"]
     workspaces:
@@ -359,6 +436,8 @@ spec:
         value: "specs/olm.spec"
       - name: TAGS
         value: "install"
+      - name: IS_DISCONNECTED
+        value: $(params.IS_DISCONNECTED)
     runAfter:
       - setup-testing-accounts
       - clone-release-tests-git
@@ -367,6 +446,8 @@ spec:
       - configure-operator
       - go-mod-cache-gauge
       - go-mod-cache-ginkgo
+      - whitelist-domains
+      - mirror-operator-images
     taskRef:
       name: release-tests
     retries: 2
@@ -1032,6 +1113,7 @@ spec:
       - release-tests-ecosystem
       - release-tests-ecosystem-multiarch
       - release-tests-ecosystem-s2i
+      - release-tests-ecosystem-disconnected
     taskRef:
       name: release-tests
     timeout: 1h30m
@@ -1296,6 +1378,59 @@ spec:
       workspace: data
       subPath: results
 
+  - name: release-tests-ecosystem-disconnected
+    onError: continue
+    params:
+      - name: CLUSTER_NAME
+        value: $(tasks.provision-cluster.results.cluster-name)
+      - name: IMAGE
+        value: $(params.IMAGE)
+      - name: TKN_DOWNLOAD_URL
+        value: $(params.TKN_DOWNLOAD_URL)
+      - name: OSP_VERSION
+        value: $(params.OPERATOR_VERSION)
+      - name: GIT_RELEASE_TESTS_BRANCH
+        value: $(params.GIT_RELEASE_TESTS_BRANCH)
+      - name: GIT_RELEASE_TESTS_GINKGO_BRANCH
+        value: $(params.GIT_RELEASE_TESTS_GINKGO_BRANCH)
+      - name: TEST_FRAMEWORK
+        value: $(params.TEST_FRAMEWORK)
+      - name: RUN_AS
+        value: "admin"
+      - name: SPECS
+        value: "specs/ecosystem/ecosystem-disconnected.spec"
+      - name: TAGS
+        value: $(params.TAGS)
+    runAfter:
+      - clone-release-tests-git
+      - clone-release-tests-ginkgo-git
+      - go-mod-cache-gauge
+      - go-mod-cache-ginkgo
+      - install-pipelines-operator
+    taskRef:
+      name: release-tests
+    timeout: 1h
+    when:
+      - input: release-tests-ecosystem-disconnected
+        operator: in
+        values: ["$(params.TEST_SUITES[*])"]
+      - input: $(params.IS_DISCONNECTED)
+        operator: in
+        values: ["true", "True"]
+    workspaces:
+    - name: release-tests-git
+      workspace: data
+      subPath: release-tests-git
+    - name: release-tests-ginkgo-git
+      workspace: data
+      subPath: release-tests-ginkgo-git
+    - name: gomod-cache
+      workspace: data
+      subPath: gomod-cache
+    - name: results
+      workspace: data
+      subPath: results
+
   # --- Evaluate results, optional uninstall ---
   - name: evaluate-test-suites
     params:
@@ -1323,6 +1458,7 @@ spec:
       - release-tests-ecosystem
       - release-tests-ecosystem-multiarch
       - release-tests-ecosystem-s2i
+      - release-tests-ecosystem-disconnected
     taskRef:
       name: evaluate-test-suites
     workspaces:

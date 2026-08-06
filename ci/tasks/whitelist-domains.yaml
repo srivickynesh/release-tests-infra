@@ -1,0 +1,60 @@
+apiVersion: tekton.dev/v1
+kind: Task
+metadata:
+  name: whitelist-domains
+spec:
+  params:
+    - name: DOMAINS
+      description: Domains to add to the Squid proxy whitelist on the bastion host
+      default: registry.npmjs.org .getcomposer.org .packagist.org oss.sonatype.org repo.maven.apache.org repo1.maven.org maven.repository.redhat.com .pythonhosted.org .pypi.org .python.org .nuget.org proxy.golang.org .gitlab.com api.hub.tekton.dev
+    - name: IMAGE
+      description: Image to run the task
+      default: quay.io/openshift-pipeline/ci:latest
+    - name: IS_DISCONNECTED
+      description: Flag to identify disconnected nature of cluster
+      default: "false"
+    - name: PROXY_HOST
+      description: Hostname of the proxy server (port will be stripped if present)
+  steps:
+    - name: whitelist
+      image: $(params.IMAGE)
+      script: |
+        #!/usr/bin/env bash
+        set -euo pipefail
+
+        if [[ "$(params.IS_DISCONNECTED)" == "false" ]]; then
+          echo "Not a disconnected cluster — skipping whitelist update."
+          exit 0
+        fi
+
+        PROXY_HOST=$(echo "$(params.PROXY_HOST)" | cut -d ":" -f1)
+
+        echo "Preparing SSH key"
+        cp /secrets/psi-pipelines-shared.pem /tmp
+        SSH_KEY=/tmp/psi-pipelines-shared.pem
+        chmod 400 "$SSH_KEY"
+
+        echo "Updating squid.conf on ${PROXY_HOST}"
+        ssh -i "${SSH_KEY}" -oStrictHostKeyChecking=no "core@${PROXY_HOST}" \
+          "sudo sed -i 's/\(acl whitelist .*\)/\1 $(params.DOMAINS) /' /srv/squid/etc/squid.conf"
+
+        ssh -i "${SSH_KEY}" -oStrictHostKeyChecking=no "core@${PROXY_HOST}" \
+          "sudo sed -i 's/\(acl Safe_ports port 21\t.*\)/acl Safe_ports port 22\n\1/' /srv/squid/etc/squid.conf"
+
+        echo "Restarting squid-proxy service"
+        ssh -i "${SSH_KEY}" -oStrictHostKeyChecking=no "core@${PROXY_HOST}" \
+          "sudo systemctl restart squid-proxy.service"
+
+        echo "Whitelist updated successfully"
+      volumeMounts:
+        - name: secrets
+          mountPath: /secrets
+  volumes:
+    - name: secrets
+      secret:
+        secretName: flexy
+        optional: true
+        items:
+          - key: psi-pipelines-shared.pem
+            path: psi-pipelines-shared.pem
+            mode: 0400

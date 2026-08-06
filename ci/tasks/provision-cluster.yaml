@@ -8,7 +8,7 @@ spec:
       description: Cluster name prefix (suffix auto-generated)
       default: upgrd
     - name: INSTALLER
-      description: "Provisioning method: aws-ipi, aro, cluster-platforms, none"
+      description: "Provisioning method: aws-ipi, aro, flexy, cluster-platforms, none"
       default: aws-ipi
     - name: BASE_DOMAIN
       default: aws.ospqa.com
@@ -30,10 +30,22 @@ spec:
     - name: CLUSTER_LIFETIME
       description: Tag for orphan cleanup (e.g. 6h)
       default: "6h"
+    - name: TEMPLATE
+      description: Flexy template path (only used when INSTALLER=flexy)
+      default: ""
+    - name: LAUNCHER_VARS
+      description: JSON config for Flexy template (only used when INSTALLER=flexy)
+      default: ""
+    - name: GIT_PRIVATE_TEMPLATES_BRANCH
+      default: master
+    - name: GIT_PRIVATE_TEMPLATES_URI
+      default: https://gitlab.cee.redhat.com/aosqe/flexy-templates.git
   results:
     - name: cluster-name
     - name: api-url
     - name: installer
+    - name: mirror-registry
+      description: URL of mirror registry (disconnected clusters) or quay.io
   steps:
     # ============================================================
     # Step 1: AWS IPI provisioning
@@ -209,6 +221,7 @@ spec:
         echo -n "${CLUSTER_NAME}" > "$(results.cluster-name.path)"
         echo -n "aws-ipi" > "$(results.installer.path)"
         echo -n "${API_URL}" > "$(results.api-url.path)"
+        echo -n "quay.io" > "$(results.mirror-registry.path)"
         echo "=== AWS IPI cluster ${CLUSTER_NAME} provisioned ==="
       volumeMounts:
         - name: work
@@ -350,6 +363,7 @@ spec:
         API_URL=$(az aro show --name "$CLUSTER_NAME" --resource-group "${CLUSTER_NAME}-rg" --query "apiserverProfile.url" -o tsv)
         CONSOLE_URL=$(az aro show --name "$CLUSTER_NAME" --resource-group "${CLUSTER_NAME}-rg" --query "consoleProfile.url" -o tsv)
         echo -n "${API_URL}" > "$(results.api-url.path)"
+        echo -n "quay.io" > "$(results.mirror-registry.path)"
 
         echo "=== Getting kubeconfig ==="
         mkdir -p auth
@@ -400,7 +414,160 @@ spec:
           mountPath: /mnt
 
     # ============================================================
-    # Step 3: Skip provisioning (cluster-platforms / none)
+    # Step 3: Flexy provisioning (disconnected / custom templates)
+    # ============================================================
+    - name: flexy
+      onError: continue
+      image: quay.io/openshift-pipeline/flexy-containerized:v1.16.6
+      workingDir: /mnt
+      script: |
+        #!/usr/bin/env bash
+        set -e -u -o pipefail
+
+        INSTALLER="$(params.INSTALLER)"
+        if [[ "${INSTALLER,,}" != "flexy" ]]; then
+          echo "INSTALLER=${INSTALLER} — not flexy, skipping"
+          exit 0
+        fi
+
+        [[ -n "$(params.CLUSTER_NAME)" ]] || { echo "ERROR: CLUSTER_NAME required"; exit 1; }
+        [[ -n "$(params.TEMPLATE)" ]] || { echo "ERROR: TEMPLATE required for flexy installer"; exit 1; }
+
+        if oc get secret "cluster-$(params.CLUSTER_NAME)" &>/dev/null; then
+          echo "Cluster secret cluster-$(params.CLUSTER_NAME) already exists — reusing"
+          echo -n "$(params.CLUSTER_NAME)" > "$(results.cluster-name.path)"
+          echo -n "flexy" > "$(results.installer.path)"
+          oc get secret "cluster-$(params.CLUSTER_NAME)" -o jsonpath='{.data.api-url}' \
+            | base64 --decode > "$(results.api-url.path)"
+          oc get secret "cluster-$(params.CLUSTER_NAME)" -o jsonpath='{.data.mirror-reg}' \
+            | base64 --decode > "$(results.mirror-registry.path)" 2>/dev/null || echo -n "quay.io" > "$(results.mirror-registry.path)"
+          exit 0
+        fi
+
+        git config --global http.sslVerify false
+
+        cluster_suffix=$(printf '%(%m%d)T'; echo '$(context.taskRun.uid)' | cut -c 1-3)
+        CLUSTER_NAME="$(params.CLUSTER_NAME)${cluster_suffix}"
+        echo -n "${CLUSTER_NAME}" > cluster-name
+        echo -n "$(context.taskRun.namespace)" > namespace
+        echo -n "flexy" > installer
+
+        echo "Preparing Flexy configuration"
+
+        while IFS= read -r line; do
+          [[ -z "$line" ]] && continue
+          export "$line"
+        done < /flexy-secrets/ENVIRONMENT
+
+        export BUSHSLICER_PRIVATE_DIR="$(pwd)/config"
+        export FLEXY_URI=https://github.com/ppitonak/verification-tests.git
+        export FLEXY_BRANCH=psych
+        export GIT_PRIVATE_TEMPLATES_BRANCH="$(params.GIT_PRIVATE_TEMPLATES_BRANCH)"
+        export GIT_PRIVATE_TEMPLATES_URI="$(params.GIT_PRIVATE_TEMPLATES_URI)"
+        export HOME=/home/jenkins
+        export INSTANCE_NAME_PREFIX="${CLUSTER_NAME}"
+        export LAUNCHER_VARS='$(params.LAUNCHER_VARS)'
+        export OCM_CLI_URL_PREFIX=https://github.com/openshift-online/ocm-cli/releases/download/v0.1.60
+        export VARIABLES_LOCATION="$(params.TEMPLATE)"
+
+        jq . &>/dev/null <<< "$LAUNCHER_VARS" \
+          || { echo "LAUNCHER_VARS must be empty or valid JSON"; exit 1; }
+
+        if [[ -n "$(params.OPENSHIFT_VERSION)" ]]; then
+          ARCH=$(echo "$(params.ARCH)" | cut -d"/" -f2)
+          MIRROR_URL="https://mirror.openshift.com/pub/openshift-v4/$ARCH/clients/ocp"
+          if [[ "$(params.OPENSHIFT_VERSION)" == *dev-preview* ]]; then
+            URL="${MIRROR_URL}-$(params.OPENSHIFT_VERSION)"
+          else
+            URL="${MIRROR_URL}/$(params.OPENSHIFT_VERSION)"
+          fi
+          PAYLOAD=$(curl -ksSL "${URL}/release.txt" 2>/dev/null | grep "Pull From:" | cut -d" " -f3) \
+            || { echo "ERROR: ${URL}/release.txt not found"; exit 1; }
+          IMAGE="{\"installer_payload_image\":\"$PAYLOAD\"}"
+        fi
+        PULL_SECRET_FILE='{"pull_secret_file":"/mnt/config/pull-secret"}'
+
+        EMPTY_JSON='{}'
+        LAUNCHER_VARS=$(echo "${IMAGE:-$EMPTY_JSON}" "$LAUNCHER_VARS" | jq -c -s add)
+        LAUNCHER_VARS=$(echo "$PULL_SECRET_FILE" "$LAUNCHER_VARS" | jq -c -s add)
+
+        mkdir -p config
+        if [[ "$VARIABLES_LOCATION" == *-on-aws* || \
+              "$VARIABLES_LOCATION" == *-on-gcp* || \
+              "$VARIABLES_LOCATION" == *-on-osp* ]]; then
+          cp /flexy-secrets/* config/
+        else
+          echo "Only AWS, GCP and PSI templates are supported."
+          exit 2
+        fi
+
+        archive_artifacts() {
+          echo "Archiving cluster metadata"
+          if [ ! -f installer-artifacts.zip ]; then
+            /usr/local/bin/install_entrypoint.sh archive-artifacts || true
+          fi
+          SRC_DIR=$(pwd)/flexy/workdir/install-dir
+
+          for FILE in "$SRC_DIR/auth" "$SRC_DIR/metadata.json" "$SRC_DIR/cluster_info.json" \
+                      "$SRC_DIR/fips_info" "$SRC_DIR/pre_action" "flexy/users.spec" "flexy/vminfo.yml"; do
+            [[ -f "${FILE}" || -d "${FILE}" ]] && cp -r "${FILE}" . || true
+          done
+
+          if [ -f "$SRC_DIR/OCPINFO.yml" ]; then
+            mkdir -p auth
+            grep password "$SRC_DIR/OCPINFO.yml" | cut -d' ' -f2 > auth/kubeadmin-password
+            grep ocp_api_url "$SRC_DIR/OCPINFO.yml" | cut -d' ' -f2 > auth/api-url
+          else
+            mkdir -p auth
+            oc config view --kubeconfig="$SRC_DIR/auth/kubeconfig" --minify \
+              -o jsonpath='{.clusters[0].cluster.server}' > auth/api-url
+          fi
+
+          if [ -f "$SRC_DIR/cf_stack_output" ]; then
+            MIRROR_REG=$(grep my_IntSvc_PublicDnsName "$SRC_DIR/cf_stack_output" | cut -d "=" -f2)
+            echo -n "${MIRROR_REG}:5000" > mirror-reg
+            echo -n "${MIRROR_REG}:5000" | tee "$(results.mirror-registry.path)"
+          else
+            echo -n "quay.io" > mirror-reg
+            echo -n "quay.io" > "$(results.mirror-registry.path)"
+          fi
+
+          echo -n "$(cat auth/api-url)" > "$(results.api-url.path)"
+        }
+        trap archive_artifacts ERR EXIT
+
+        echo "=== Installing cluster with Flexy template: ${VARIABLES_LOCATION} ==="
+        /usr/local/bin/install_entrypoint.sh install
+
+        echo "=== Creating cluster secret ==="
+        oc create secret generic "cluster-${CLUSTER_NAME}" \
+          --from-literal=installer=flexy \
+          --from-literal=api-url="$(cat auth/api-url)" \
+          --from-literal=admin-name=kubeadmin \
+          --from-literal=kubeadmin-password="$(cat auth/kubeadmin-password)" \
+          --from-literal=user-password=user --from-literal=admin-token="" \
+          --from-literal=insecure-skip-tls-verify=true \
+          --from-literal=mirror-reg="$(cat mirror-reg)" \
+          --from-literal=cluster-name="${CLUSTER_NAME}" \
+          --from-file=metadata.json=metadata.json 2>/dev/null || true
+        oc label secret "cluster-${CLUSTER_NAME}" pipelines-ci=true installer=flexy --overwrite 2>/dev/null || true
+
+        if [[ -f pre_action/aws_sg_ids_cluster ]]; then
+          oc patch secret "cluster-${CLUSTER_NAME}" \
+            --type=merge -p "{\"data\":{\"aws_sg_ids_cluster\":\"$(base64 -w0 pre_action/aws_sg_ids_cluster)\"}}" 2>/dev/null || true
+        fi
+
+        echo -n "${CLUSTER_NAME}" > "$(results.cluster-name.path)"
+        echo -n "flexy" > "$(results.installer.path)"
+        echo "=== Flexy cluster ${CLUSTER_NAME} provisioned ==="
+      volumeMounts:
+        - name: work
+          mountPath: /mnt
+        - name: flexy-secrets
+          mountPath: /flexy-secrets
+
+    # ============================================================
+    # Step 4: Skip provisioning (cluster-platforms / none)
     # ============================================================
     - name: skip-provision
       image: image-registry.openshift-image-registry.svc:5000/openshift/cli:latest
@@ -418,7 +585,7 @@ spec:
 
         # If installer requires provisioning but previous step failed, fail explicitly
         case "$INSTALLER" in
-          aws-ipi|aro|rosa)
+          aws-ipi|aro|rosa|flexy)
             echo "ERROR: INSTALLER=${INSTALLER} provisioning step failed — check aws-ipi/aro step logs"
             echo "  Ensure aws-creds, aws-install-config (or azure-creds) secrets exist in pipelines-ci"
             exit 1
@@ -430,6 +597,8 @@ spec:
         echo -n "${INSTALLER}" > "$(results.installer.path)"
         oc get secret "cluster-$(params.CLUSTER_NAME)" -o jsonpath='{.data.api-url}' \
           | base64 -d > "$(results.api-url.path)" 2>/dev/null || echo -n "" > "$(results.api-url.path)"
+        MIRROR_REG=$(oc get secret "cluster-$(params.CLUSTER_NAME)" -o go-template='{{index .data "mirror-reg" | base64decode}}' 2>/dev/null || echo "quay.io")
+        echo -n "${MIRROR_REG}" > "$(results.mirror-registry.path)"
       volumeMounts:
         - name: work
           mountPath: /mnt
@@ -437,3 +606,7 @@ spec:
   volumes:
     - name: work
       emptyDir: {}
+    - name: flexy-secrets
+      secret:
+        optional: true
+        secretName: flexy

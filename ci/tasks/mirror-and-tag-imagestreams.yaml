@@ -1,0 +1,104 @@
+apiVersion: tekton.dev/v1
+kind: Task
+metadata:
+  name: mirror-and-tag-imagestreams
+spec:
+  workspaces:
+    - name: build-artifacts
+      readOnly: true
+  params:
+    - name: CLUSTER_NAME
+      type: string
+      description: Cluster name
+    - name: IMAGE
+      description: CI image with oc tools
+      default: quay.io/openshift-pipeline/ci:latest
+  steps:
+    - name: mirror-and-tag-imagestreams
+      image: $(params.IMAGE)
+      env:
+        - name: ADMIN_NAME
+          valueFrom:
+            secretKeyRef:
+              key: admin-name
+              name: cluster-$(params.CLUSTER_NAME)
+              optional: true
+        - name: ADMIN_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              key: kubeadmin-password
+              name: cluster-$(params.CLUSTER_NAME)
+        - name: APISERVER
+          valueFrom:
+            secretKeyRef:
+              key: api-url
+              name: cluster-$(params.CLUSTER_NAME)
+        - name: MIRROR_REG
+          valueFrom:
+            secretKeyRef:
+              key: mirror-reg
+              name: cluster-$(params.CLUSTER_NAME)
+      script: |
+        #!/usr/bin/env bash
+        set -euo pipefail
+
+        ADMIN_NAME=${ADMIN_NAME:-kubeadmin}
+        echo "Logging in to cluster $(params.CLUSTER_NAME) as user '$ADMIN_NAME'"
+        oc login -u "$ADMIN_NAME" -p "$ADMIN_PASSWORD" "$APISERVER" --insecure-skip-tls-verify=true
+
+        if [ ! -f "$(workspaces.build-artifacts.path)/pull-secret" ]; then
+          echo "ERROR: pull-secret not found in build-artifacts workspace"
+          exit 1
+        fi
+
+        REG_CREDS="$(workspaces.build-artifacts.path)/pull-secret"
+
+        oc patch configs.samples.operator.openshift.io/cluster \
+          -p '{"spec":{"managementState":"Managed"}}' --type=merge
+
+        cat <<EOF | oc apply -f -
+        apiVersion: image.openshift.io/v1
+        kind: ImageStream
+        metadata:
+          name: fedora
+          namespace: openshift
+        spec:
+          tags:
+          - from:
+              kind: DockerImage
+              name: quay.io/fedora/fedora:38
+            name: "38"
+        EOF
+
+        ret=0
+        image_streams=("cli" "dotnet" "fedora" "golang" "java" "nodejs" "perl" "php" "python" "ruby")
+
+        for IS in "${image_streams[@]}"; do
+          oc get is "$IS" -n openshift -o json 2>/dev/null | \
+            jq -r '.metadata.name as $is | .spec.tags[]? | $is + ":" + .name + " " + .from.name' || true
+        done | grep 'quay.io\|redhat.com\|redhat.io' | while read -r line; do
+          IMAGE_STREAM=($line)
+          TAG=${IMAGE_STREAM[0]}
+          ORIG_IMAGE=${IMAGE_STREAM[1]}
+          MIRR_IMAGE=$(cut -d "/" -f2- <<< "$ORIG_IMAGE")
+
+          if [[ "$MIRR_IMAGE" == *"sha"* ]]; then
+            image_url=$(cut -d "@" -f1 <<< "$MIRR_IMAGE")
+            sha=$(cut -d "@" -f2 <<< "$MIRR_IMAGE")
+            echo -e "\nMirroring sha image $ORIG_IMAGE to $MIRROR_REG/$image_url@$sha for tag $TAG"
+            oc image mirror "$ORIG_IMAGE" "$MIRROR_REG/$image_url" \
+              --keep-manifest-list=true --filter-by-os=".*" -a "$REG_CREDS" --insecure || ret=1
+            echo -e "\nTagging image $MIRROR_REG/$image_url@$sha as $TAG"
+            oc tag "$MIRROR_REG/$image_url@$sha" "$TAG" --scheduled=true -n openshift || ret=2
+          else
+            image_url=$(cut -d ":" -f1 <<< "$MIRR_IMAGE")
+            tag=$(cut -d ":" -f2 <<< "$MIRR_IMAGE")
+            echo -e "\nMirroring image $ORIG_IMAGE to $MIRROR_REG/$image_url:$tag for tag $TAG"
+            oc image mirror "$ORIG_IMAGE" "$MIRROR_REG/$image_url:$tag" \
+              --keep-manifest-list=true --filter-by-os=".*" -a "$REG_CREDS" --insecure || ret=1
+            echo -e "\nTagging image $MIRROR_REG/$image_url:$tag as $TAG"
+            oc tag "$MIRROR_REG/$image_url:$tag" "$TAG" --scheduled=true -n openshift || ret=2
+          fi
+        done
+
+        exit $ret
