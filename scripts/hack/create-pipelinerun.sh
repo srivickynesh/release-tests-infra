@@ -212,6 +212,8 @@ spec:
       value: "${OPERATOR_VERSION}"
     - name: GIT_INFRA_BRANCH
       value: "${GIT_INFRA_BRANCH:-main}"
+    - name: GIT_INFRA_URI
+      value: "${GIT_INFRA_URI:-}"
     - name: TAGS
       value: "${TAGS}"
     - name: TEST_SUITES
@@ -239,6 +241,12 @@ EOF
       value: "${GIT_PRIVATE_TEMPLATES_URI:-https://gitlab.cee.redhat.com/aosqe/flexy-templates.git}"
   timeouts:
     pipeline: 3h
+  taskRunTemplate:
+    podTemplate:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1001
+        fsGroup: 0
   workspaces:
 EOF
   write_workspace_spec >> "$pr"

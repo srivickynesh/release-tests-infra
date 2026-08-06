@@ -16,11 +16,12 @@ spec:
       description: Operator environment (prod, stage, pre-stage)
       default: pre-stage
     - name: IMAGE
-      description: CI image with oc-mirror installed
-      default: quay.io/openshift-pipeline/ci:latest
+      description: CI image for running oc-mirror
+      default: quay.io/openshift-pipeline/ci:test
   steps:
     - name: mirror-operator-images
       image: $(params.IMAGE)
+      workingDir: /tmp
       env:
         - name: HOME
           value: /tmp
@@ -43,11 +44,19 @@ spec:
           exit 1
         fi
 
+        # Download oc-mirror from mirror.openshift.com
+        ARCH=$(uname -m | sed 's/x86_64/amd64/;s/aarch64/arm64/')
+        OC_MIRROR_URL="https://mirror.openshift.com/pub/openshift-v4/${ARCH}/clients/ocp/stable/oc-mirror.tar.gz"
+        echo "Downloading oc-mirror from ${OC_MIRROR_URL}..."
+        curl -fsSL "$OC_MIRROR_URL" | tar xz -C /tmp oc-mirror
+        chmod +x /tmp/oc-mirror
+        echo "oc-mirror version: $(/tmp/oc-mirror version 2>&1 | head -1 || echo unknown)"
+
         REG_CREDS="$(workspaces.build-artifacts.path)/pull-secret"
         MIRROR_REG="$(params.MIRROR_REGISTRY)"
 
         echo "=== Mirroring operator images to ${MIRROR_REG} ==="
-        oc-mirror --v2 \
+        /tmp/oc-mirror --v2 \
           --config="$(workspaces.build-artifacts.path)/imageset-config.yaml" \
           --workspace file://./oc-mirror-workspace \
           --src-tls-verify=false \
