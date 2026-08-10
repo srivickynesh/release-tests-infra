@@ -115,8 +115,10 @@ spec:
             OCP_MINOR=$(echo "$OCP_MAJOR_MINOR" | cut -d. -f2)
             if [ "$OCP_MAJOR" -eq 4 ] && [ "$OCP_MINOR" -le 17 ]; then
               CL_CHANNEL="stable-6.1"
+            elif [ "$OCP_MAJOR" -eq 4 ] && [ "$OCP_MINOR" -le 19 ]; then
+              CL_CHANNEL="stable-6.5"
             else
-              CL_CHANNEL="stable-6.3"
+              CL_CHANNEL="stable-6.5"
             fi
 
             echo ""

@@ -37,7 +37,9 @@ source "$SCRIPT_DIR/cluster-login.sh"
 CLUSTER_PREFIX="${CLUSTER_NAME:-air}"
 OCP_VERSION="${OPENSHIFT_VERSION:-stable-4.19}"
 TEMPLATE="${TEMPLATE:?TEMPLATE is required (e.g. private-templates/functionality-testing/aos-4_19/ipi-on-aws/versioned-installer-customer_vpc-disconnected)}"
-LAUNCHER_VARS="${LAUNCHER_VARS:-{\"dynamic_bastion_host\":\"yes\"}}"
+if [[ -z "${LAUNCHER_VARS:-}" ]]; then
+  LAUNCHER_VARS='{"dynamic_bastion_host":"yes"}'
+fi
 GIT_TEMPLATES_BRANCH="${GIT_PRIVATE_TEMPLATES_BRANCH:-master}"
 GIT_TEMPLATES_URI="${GIT_PRIVATE_TEMPLATES_URI:-https://gitlab.cee.redhat.com/aosqe/flexy-templates.git}"
 LIFETIME="${CLUSTER_LIFETIME:-48h}"
@@ -56,6 +58,7 @@ if [[ "${1:-}" == "--destroy" ]]; then
   if [[ -f "$DESTROY_DIR/metadata.json" ]]; then
     CONTAINER_RT=$(command -v podman 2>/dev/null || command -v docker 2>/dev/null || die "podman or docker required")
     "$CONTAINER_RT" run --rm \
+      --platform linux/amd64 \
       -v "$DESTROY_DIR:/mnt:Z" \
       -v "${HOME}/.aws:/root/.aws:ro" \
       --entrypoint bash \
@@ -125,6 +128,7 @@ echo "  Payload: ${PAYLOAD}"
 MERGED_VARS=$(echo \
   "{\"installer_payload_image\":\"$PAYLOAD\"}" \
   "{\"pull_secret_file\":\"/mnt/config/pull-secret\"}" \
+  "{\"credentials_file\":\"awscreds\"}" \
   "$LAUNCHER_VARS" | jq -c -s add)
 
 # --- Prepare work directory ---
@@ -138,16 +142,46 @@ aws_access_key_id = ${AWS_ACCESS_KEY:-${AWS_ACCESS_KEY_ID}}
 aws_secret_access_key = ${AWS_ACCESS_SECRET:-${AWS_SECRET_ACCESS_KEY}}
 AWSEOF
 elif [[ -f ~/.aws/credentials ]]; then
-  cp ~/.aws/credentials "$WORK_DIR/config/awscreds"
+  # Rewrite profile header to [flexy-installer] for Flexy compatibility
+  sed 's/^\[.*\]/[flexy-installer]/' ~/.aws/credentials > "$WORK_DIR/config/awscreds"
 fi
 
 [[ -n "$SSH_KEY_FILE" ]] && cp "$SSH_KEY_FILE" "$WORK_DIR/config/psi-pipelines-shared.pem"
+# Generate public key from private key for Flexy template
+[[ -n "$SSH_KEY_FILE" ]] && ssh-keygen -y -f "$SSH_KEY_FILE" > "$WORK_DIR/config/psi-pipelines-shared.pub" 2>/dev/null
+
+# Create BushSlicer private config overlay for AWS host_opts
+cat > "$WORK_DIR/config/config.yaml" <<'CFGEOF'
+services:
+  AWS:
+    host_opts:
+      ssh_private_key: psi-pipelines-shared.pem
+      user: core
+    install_base_domain: aws.ospqa.com
+CFGEOF
+
+# Build AWS_CREDENTIALS string (key:secret format for Flexy)
+if [[ -n "${AWS_ACCESS_KEY:-${AWS_ACCESS_KEY_ID:-}}" ]]; then
+  FLEXY_AWS_CREDS="${AWS_ACCESS_KEY:-${AWS_ACCESS_KEY_ID}}:${AWS_ACCESS_SECRET:-${AWS_SECRET_ACCESS_KEY}}"
+elif [[ -f ~/.aws/credentials ]]; then
+  _ak=$(grep aws_access_key_id ~/.aws/credentials | head -1 | awk -F= '{print $2}' | xargs)
+  _sk=$(grep aws_secret_access_key ~/.aws/credentials | head -1 | awk -F= '{print $2}' | xargs)
+  FLEXY_AWS_CREDS="${_ak}:${_sk}"
+fi
+[[ -n "${FLEXY_AWS_CREDS:-}" ]] || die "Cannot determine AWS credentials for Flexy"
 
 # --- Run Flexy ---
 echo ""
 echo "=== Running Flexy installer ==="
+
+# BushSlicer config override via env (merged last, highest priority) — inline YAML
+BUSHSLICER_CFG='{services: {AWS: {host_opts: {ssh_private_key: psi-pipelines-shared.pem, user: core}, install_base_domain: aws.ospqa.com}}}'
+
 FLEXY_ENV=(
   -e "BUSHSLICER_PRIVATE_DIR=/mnt/config"
+  -e "BUSHSLICER_CONFIG=${BUSHSLICER_CFG}"
+  -e "AWS_CREDENTIALS=${FLEXY_AWS_CREDS}"
+  -e "AWS_SHARED_CREDENTIALS_FILE=/mnt/config/awscreds"
   -e "FLEXY_URI=https://github.com/ppitonak/verification-tests.git"
   -e "FLEXY_BRANCH=psych"
   -e "GIT_PRIVATE_TEMPLATES_BRANCH=${GIT_TEMPLATES_BRANCH}"
@@ -160,11 +194,52 @@ FLEXY_ENV=(
   -e "GIT_SSL_NO_VERIFY=true"
 )
 
+# Create a wrapper script that patches config between clone and installer
+cat > "$WORK_DIR/flexy-install-wrapper.sh" <<'WRAPPER'
+#!/bin/bash -xe
+export BASEDIR=$(pwd)
+export WORKSPACE="$BASEDIR/flexy"
+export BUSHSLICER_VMINFO_YAML="$WORKSPACE/vminfo.yml"
+export BUSHSLICER_HOSTS_SPEC_FILE="$WORKSPACE/host.spec"
+
+# Re-use entrypoint functions by extracting them
+eval "$(sed -n '/^function /,/^}/p' /usr/local/bin/install_entrypoint.sh)"
+
+# Clone repos and install gems
+git_clone_all
+gem_deps
+
+# Patch the base config to add host_opts for AWS-CI (used by disconnected template)
+cd "$WORKSPACE"
+ruby -ryaml -e '
+  cfg = YAML.load_file("config/config.yaml")
+  cfg["services"] ||= {}
+  %w[AWS AWS-CI].each do |svc|
+    cfg["services"][svc] ||= {}
+    cfg["services"][svc]["host_opts"] = {
+      "ssh_private_key" => "psi-pipelines-shared.pem",
+      "user" => "core"
+    }
+    cfg["services"][svc]["install_base_domain"] = "aws.ospqa.com"
+  end
+  File.write("config/config.yaml", cfg.to_yaml)
+'
+echo "=== Patched config/config.yaml with host_opts for AWS and AWS-CI ==="
+
+# Run the installer
+rm -f "$BUSHSLICER_HOSTS_SPEC_FILE" "$BUSHSLICER_VMINFO_YAML"
+ruby tools/launch_instance.rb template -c "$(echo ${VARIABLES_LOCATION} | xargs)" -l "$(echo ${INSTANCE_NAME_PREFIX} | xargs)"
+WRAPPER
+chmod +x "$WORK_DIR/flexy-install-wrapper.sh"
+
 "$CONTAINER_RT" run --rm \
+  --platform linux/amd64 \
+  -w /mnt \
   -v "$WORK_DIR:/mnt:Z" \
+  --entrypoint bash \
   "${FLEXY_ENV[@]}" \
   "$FLEXY_IMAGE" \
-  /usr/local/bin/install_entrypoint.sh install 2>&1 | tee "$WORK_DIR/install.log"
+  /mnt/flexy-install-wrapper.sh 2>&1 | tee "$WORK_DIR/install.log"
 
 # --- Extract results ---
 echo ""

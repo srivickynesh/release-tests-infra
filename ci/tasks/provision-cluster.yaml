@@ -452,6 +452,7 @@ spec:
         fi
 
         git config --global http.sslVerify false
+        export GIT_SSL_NO_VERIFY=true
 
         cluster_suffix=$(printf '%(%m%d)T'; echo '$(context.taskRun.uid)' | cut -c 1-3)
         CLUSTER_NAME="$(params.CLUSTER_NAME)${cluster_suffix}"
@@ -547,6 +548,10 @@ spec:
         /usr/local/bin/install_entrypoint.sh install
 
         echo "=== Creating cluster secret ==="
+        # Reset to in-cluster credentials (Flexy may have altered KUBECONFIG)
+        unset KUBECONFIG
+        export HOME=/tmp
+        OC_ARGS="--server=https://kubernetes.default.svc --token=$(cat /var/run/secrets/kubernetes.io/serviceaccount/token) --certificate-authority=/var/run/secrets/kubernetes.io/serviceaccount/ca.crt -n $(context.taskRun.namespace)"
         oc create secret generic "cluster-${CLUSTER_NAME}" \
           --from-literal=installer=flexy \
           --from-literal=api-url="$(cat auth/api-url)" \
@@ -556,17 +561,24 @@ spec:
           --from-literal=insecure-skip-tls-verify=true \
           --from-literal=mirror-reg="$(cat mirror-reg)" \
           --from-literal=cluster-name="${CLUSTER_NAME}" \
-          --from-file=metadata.json=metadata.json 2>/dev/null || true
-        oc label secret "cluster-${CLUSTER_NAME}" pipelines-ci=true installer=flexy --overwrite 2>/dev/null || true
+          --from-file=metadata.json=metadata.json $OC_ARGS || true
+        oc label secret "cluster-${CLUSTER_NAME}" pipelines-ci=true installer=flexy --overwrite $OC_ARGS || true
 
         if [[ -f pre_action/aws_sg_ids_cluster ]]; then
           oc patch secret "cluster-${CLUSTER_NAME}" \
-            --type=merge -p "{\"data\":{\"aws_sg_ids_cluster\":\"$(base64 -w0 pre_action/aws_sg_ids_cluster)\"}}" 2>/dev/null || true
+            --type=merge -p "{\"data\":{\"aws_sg_ids_cluster\":\"$(base64 -w0 pre_action/aws_sg_ids_cluster)\"}}" $OC_ARGS || true
         fi
 
         echo -n "${CLUSTER_NAME}" > "$(results.cluster-name.path)"
         echo -n "flexy" > "$(results.installer.path)"
         echo "=== Flexy cluster ${CLUSTER_NAME} provisioned ==="
+      computeResources:
+        requests:
+          cpu: 500m
+          memory: 2Gi
+        limits:
+          cpu: "4"
+          memory: 8Gi
       volumeMounts:
         - name: work
           mountPath: /mnt
