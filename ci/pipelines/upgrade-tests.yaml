@@ -36,9 +36,15 @@ spec:
     default: https://github.com/openshift-pipelines/release-tests.git
   - name: GIT_RELEASE_TESTS_BRANCH
     default: ""
+  - name: PRE_UPGRADE_GIT_RELEASE_TESTS_BRANCH
+    description: "Release-tests branch for pre-upgrade install and pre-upgrade tests. Resolved from PRE_UPGRADE_VERSION via ci-config.yaml."
+    default: ""
   - name: GIT_RELEASE_TESTS_GINKGO_URI
     default: https://github.com/openshift-pipelines/release-tests-ginkgo.git
   - name: GIT_RELEASE_TESTS_GINKGO_BRANCH
+    default: ""
+  - name: PRE_UPGRADE_GIT_RELEASE_TESTS_GINKGO_BRANCH
+    description: "Release-tests-ginkgo branch for pre-upgrade install and pre-upgrade tests."
     default: ""
   - name: TEST_FRAMEWORK
     description: gauge or ginkgo
@@ -219,6 +225,65 @@ spec:
       workspace: data
       subPath: release-tests-ginkgo-git
 
+  # Clone release-tests at the PRE_UPGRADE branch (separate workspace for pre-upgrade tasks)
+  - name: clone-release-tests-git-pre-upgrade
+    runAfter:
+      - provision-cluster
+    params:
+      - name: URL
+        value: $(params.GIT_RELEASE_TESTS_URI)
+      - name: DELETE_EXISTING
+        value: "true"
+      - name: REVISION
+        value: $(params.PRE_UPGRADE_GIT_RELEASE_TESTS_BRANCH)
+    taskRef:
+      resolver: cluster
+      params:
+      - name: kind
+        value: task
+      - name: name
+        value: git-clone
+      - name: namespace
+        value: openshift-pipelines
+    timeout: 10m
+    when:
+      - input: $(params.TEST_FRAMEWORK)
+        operator: in
+        values: ["gauge", "Gauge", "GAUGE", ""]
+    workspaces:
+    - name: output
+      workspace: data
+      subPath: release-tests-git-pre-upgrade
+
+  - name: clone-release-tests-ginkgo-git-pre-upgrade
+    runAfter:
+      - provision-cluster
+    params:
+      - name: URL
+        value: $(params.GIT_RELEASE_TESTS_GINKGO_URI)
+      - name: DELETE_EXISTING
+        value: "true"
+      - name: REVISION
+        value: $(params.PRE_UPGRADE_GIT_RELEASE_TESTS_GINKGO_BRANCH)
+    taskRef:
+      resolver: cluster
+      params:
+      - name: kind
+        value: task
+      - name: name
+        value: git-clone
+      - name: namespace
+        value: openshift-pipelines
+    timeout: 10m
+    when:
+      - input: $(params.TEST_FRAMEWORK)
+        operator: in
+        values: ["ginkgo", "Ginkgo", "GINKGO"]
+    workspaces:
+    - name: output
+      workspace: data
+      subPath: release-tests-ginkgo-git-pre-upgrade
+
   # ============================================================
   # Setup + go-mod-cache (parallel)
   # ============================================================
@@ -381,9 +446,9 @@ spec:
       - name: CHANNEL_VERSION
         value: $(params.PRE_UPGRADE_VERSION)
       - name: GIT_RELEASE_TESTS_BRANCH
-        value: $(params.GIT_RELEASE_TESTS_BRANCH)
+        value: $(params.PRE_UPGRADE_GIT_RELEASE_TESTS_BRANCH)
       - name: GIT_RELEASE_TESTS_GINKGO_BRANCH
-        value: $(params.GIT_RELEASE_TESTS_GINKGO_BRANCH)
+        value: $(params.PRE_UPGRADE_GIT_RELEASE_TESTS_GINKGO_BRANCH)
       - name: TEST_FRAMEWORK
         value: $(params.TEST_FRAMEWORK)
       - name: RUN_AS
@@ -393,8 +458,8 @@ spec:
       - name: TAGS
         value: "install"
     runAfter:
-      - clone-release-tests-git
-      - clone-release-tests-ginkgo-git
+      - clone-release-tests-git-pre-upgrade
+      - clone-release-tests-ginkgo-git-pre-upgrade
       - configure-operator-pre-upgrade
       - go-mod-cache-gauge
       - go-mod-cache-ginkgo
@@ -409,10 +474,10 @@ spec:
     workspaces:
     - name: release-tests-git
       workspace: data
-      subPath: release-tests-git
+      subPath: release-tests-git-pre-upgrade
     - name: release-tests-ginkgo-git
       workspace: data
-      subPath: release-tests-ginkgo-git
+      subPath: release-tests-ginkgo-git-pre-upgrade
     - name: gomod-cache
       workspace: data
       subPath: gomod-cache
@@ -439,9 +504,9 @@ spec:
       - name: OSP_VERSION
         value: $(params.PRE_UPGRADE_VERSION)
       - name: GIT_RELEASE_TESTS_BRANCH
-        value: $(params.GIT_RELEASE_TESTS_BRANCH)
+        value: $(params.PRE_UPGRADE_GIT_RELEASE_TESTS_BRANCH)
       - name: GIT_RELEASE_TESTS_GINKGO_BRANCH
-        value: $(params.GIT_RELEASE_TESTS_GINKGO_BRANCH)
+        value: $(params.PRE_UPGRADE_GIT_RELEASE_TESTS_GINKGO_BRANCH)
       - name: TEST_FRAMEWORK
         value: $(params.TEST_FRAMEWORK)
       - name: RUN_AS
@@ -462,10 +527,10 @@ spec:
     workspaces:
     - name: release-tests-git
       workspace: data
-      subPath: release-tests-git
+      subPath: release-tests-git-pre-upgrade
     - name: release-tests-ginkgo-git
       workspace: data
-      subPath: release-tests-ginkgo-git
+      subPath: release-tests-ginkgo-git-pre-upgrade
     - name: gomod-cache
       workspace: data
       subPath: gomod-cache
@@ -556,6 +621,8 @@ spec:
         value: "upgrade"
     runAfter:
       - configure-operator-upgrade
+      - clone-release-tests-git
+      - clone-release-tests-ginkgo-git
     taskRef:
       name: release-tests
     timeout: 1h

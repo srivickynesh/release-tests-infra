@@ -164,6 +164,8 @@ FW="$(printf '%s' "${TEST_FRAMEWORK:-gauge}" | tr '[:upper:]' '[:lower:]')"
 # Empty branch vars from env.template must not block ci-config.yaml auto-resolve.
 [[ -z "${GIT_RELEASE_TESTS_BRANCH:-}" ]] && unset GIT_RELEASE_TESTS_BRANCH
 [[ -z "${GIT_RELEASE_TESTS_GINKGO_BRANCH:-}" ]] && unset GIT_RELEASE_TESTS_GINKGO_BRANCH
+[[ -z "${PRE_UPGRADE_GIT_RELEASE_TESTS_BRANCH:-}" ]] && unset PRE_UPGRADE_GIT_RELEASE_TESTS_BRANCH
+[[ -z "${PRE_UPGRADE_GIT_RELEASE_TESTS_GINKGO_BRANCH:-}" ]] && unset PRE_UPGRADE_GIT_RELEASE_TESTS_GINKGO_BRANCH
 
 # Auto-resolve git branches from ci-config.yaml using UPGRADE_VERSION (e.g. 1.15.5 → 1.15)
 ver_short="$(ci_config_major_minor "${UPGRADE_VERSION:-}")"
@@ -182,11 +184,30 @@ if [[ "$FW" == ginkgo && -z "${GIT_RELEASE_TESTS_GINKGO_BRANCH:-}" ]]; then
   fi
 fi
 
+# Auto-resolve pre-upgrade git branches from ci-config.yaml using PRE_UPGRADE_VERSION
+pre_ver_short="$(ci_config_major_minor "${PRE_UPGRADE_VERSION:-}")"
+if [[ "$FW" == gauge && -z "${PRE_UPGRADE_GIT_RELEASE_TESTS_BRANCH:-}" ]]; then
+  if PRE_UPGRADE_GIT_RELEASE_TESTS_BRANCH=$(ci_config_get "$pre_ver_short" release-tests.revision); then
+    echo "Auto-resolved PRE_UPGRADE_GIT_RELEASE_TESTS_BRANCH=${PRE_UPGRADE_GIT_RELEASE_TESTS_BRANCH} from ci-config.yaml (${pre_ver_short})"
+  else
+    missing+=("PRE_UPGRADE_GIT_RELEASE_TESTS_BRANCH (ci-config.yaml has no release-tests.revision for ${pre_ver_short} from PRE_UPGRADE_VERSION=${PRE_UPGRADE_VERSION:-})")
+  fi
+fi
+if [[ "$FW" == ginkgo && -z "${PRE_UPGRADE_GIT_RELEASE_TESTS_GINKGO_BRANCH:-}" ]]; then
+  if PRE_UPGRADE_GIT_RELEASE_TESTS_GINKGO_BRANCH=$(ci_config_get "$pre_ver_short" release-tests-ginkgo.revision); then
+    echo "Auto-resolved PRE_UPGRADE_GIT_RELEASE_TESTS_GINKGO_BRANCH=${PRE_UPGRADE_GIT_RELEASE_TESTS_GINKGO_BRANCH} from ci-config.yaml (${pre_ver_short})"
+  else
+    missing+=("PRE_UPGRADE_GIT_RELEASE_TESTS_GINKGO_BRANCH (ci-config.yaml has no release-tests-ginkgo.revision for ${pre_ver_short} from PRE_UPGRADE_VERSION=${PRE_UPGRADE_VERSION:-})")
+  fi
+fi
+
 case "$FW" in
   gauge)
-    [[ -n "${GIT_RELEASE_TESTS_BRANCH:-}" ]] || missing+=("GIT_RELEASE_TESTS_BRANCH (set in env/.env or add to ci-config.yaml)") ;;
+    [[ -n "${GIT_RELEASE_TESTS_BRANCH:-}" ]] || missing+=("GIT_RELEASE_TESTS_BRANCH (set in env/.env or add to ci-config.yaml)")
+    [[ -n "${PRE_UPGRADE_GIT_RELEASE_TESTS_BRANCH:-}" ]] || missing+=("PRE_UPGRADE_GIT_RELEASE_TESTS_BRANCH (set in env/.env or add to ci-config.yaml)") ;;
   ginkgo)
-    [[ -n "${GIT_RELEASE_TESTS_GINKGO_BRANCH:-}" ]] || missing+=("GIT_RELEASE_TESTS_GINKGO_BRANCH (set in env/.env or add to ci-config.yaml)") ;;
+    [[ -n "${GIT_RELEASE_TESTS_GINKGO_BRANCH:-}" ]] || missing+=("GIT_RELEASE_TESTS_GINKGO_BRANCH (set in env/.env or add to ci-config.yaml)")
+    [[ -n "${PRE_UPGRADE_GIT_RELEASE_TESTS_GINKGO_BRANCH:-}" ]] || missing+=("PRE_UPGRADE_GIT_RELEASE_TESTS_GINKGO_BRANCH (set in env/.env or add to ci-config.yaml)") ;;
   *) missing+=("TEST_FRAMEWORK must be gauge or ginkgo (got: $FW)") ;;
 esac
 
@@ -264,8 +285,8 @@ PREFIX="upgrade-tests-${_installer_tag}${_pre_short}-to-${_upg_short}-on-${_ocp_
 echo "=== Upgrade PipelineRun → ${NS} ==="
 echo "    installer: ${INSTALLER}"
 echo "    framework: ${FW}"
-echo "    pre-upgrade: ${PRE_UPGRADE_VERSION} (${PRE_UPGRADE_OPERATOR_ENVIRONMENT:-prod}/${PRE_UPGRADE_CATALOG_SOURCE:-redhat-operators})"
-echo "    upgrade:     ${UPGRADE_VERSION} (${UPGRADE_OPERATOR_ENVIRONMENT:-pre-stage}/${UPGRADE_CATALOG_SOURCE:-custom-operators})"
+echo "    pre-upgrade: ${PRE_UPGRADE_VERSION} (${PRE_UPGRADE_OPERATOR_ENVIRONMENT:-prod}/${PRE_UPGRADE_CATALOG_SOURCE:-redhat-operators}) branch=${PRE_UPGRADE_GIT_RELEASE_TESTS_BRANCH:-${PRE_UPGRADE_GIT_RELEASE_TESTS_GINKGO_BRANCH:-}}"
+echo "    upgrade:     ${UPGRADE_VERSION} (${UPGRADE_OPERATOR_ENVIRONMENT:-pre-stage}/${UPGRADE_CATALOG_SOURCE:-custom-operators}) branch=${GIT_RELEASE_TESTS_BRANCH:-${GIT_RELEASE_TESTS_GINKGO_BRANCH:-}}"
 echo "    suites: ${TEST_SUITE_ITEMS[*]}"
 
 write_pipelinerun() {
@@ -304,10 +325,14 @@ spec:
       value: "${GIT_RELEASE_TESTS_URI:-https://github.com/openshift-pipelines/release-tests.git}"
     - name: GIT_RELEASE_TESTS_BRANCH
       value: "${GIT_RELEASE_TESTS_BRANCH:-}"
+    - name: PRE_UPGRADE_GIT_RELEASE_TESTS_BRANCH
+      value: "${PRE_UPGRADE_GIT_RELEASE_TESTS_BRANCH:-}"
     - name: GIT_RELEASE_TESTS_GINKGO_URI
       value: "${GIT_RELEASE_TESTS_GINKGO_URI:-https://github.com/openshift-pipelines/release-tests-ginkgo.git}"
     - name: GIT_RELEASE_TESTS_GINKGO_BRANCH
       value: "${GIT_RELEASE_TESTS_GINKGO_BRANCH:-}"
+    - name: PRE_UPGRADE_GIT_RELEASE_TESTS_GINKGO_BRANCH
+      value: "${PRE_UPGRADE_GIT_RELEASE_TESTS_GINKGO_BRANCH:-}"
     - name: TEST_FRAMEWORK
       value: "${FW}"
     - name: IMAGE
